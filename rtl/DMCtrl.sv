@@ -111,16 +111,17 @@ module DMCtrl
     logic [ADDR_WIDTH-1:0] address_r;
     /* verilator lint_on UNUSEDSIGNAL */
 
-    assign tag        = address_i[ADDR_WIDTH-1:ADDR_WIDTH-TAG_WIDTH];
-    assign tag_r      = address_r[ADDR_WIDTH-1:ADDR_WIDTH-TAG_WIDTH];
-    assign miss       = !entries[line_idx].valid || entries[line_idx].tag != tag;
-    assign offset     = address_i[OFFSET_WIDTH-1:0];
-    assign line_idx   = address_i[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
-    assign line_idx_r = address_r[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
-    assign is_dirty   = (WMODE == WRITE_BACK) && entries[line_idx].valid && entries[line_idx].dirty;
-    assign is_write   = ce_i && (we_i != '0);
-    assign end_fill   = mem_valid && (cache_idx == word_idx_t'(FILL_WORDS-1));
-    assign end_evict  = cache_valid && !mem_busy_i && (mem_idx == word_idx_t'(FILL_WORDS-1));
+    assign tag         = address_i[ADDR_WIDTH-1:ADDR_WIDTH-TAG_WIDTH];
+    assign tag_r       = address_r[ADDR_WIDTH-1:ADDR_WIDTH-TAG_WIDTH];
+    assign miss        = !entries[line_idx].valid || entries[line_idx].tag != tag;
+    assign offset      = address_i[OFFSET_WIDTH-1:0];
+    assign line_idx    = address_i[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
+    assign line_idx_r  = address_r[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
+    assign evict_tag_r = entries[line_idx_r].tag;
+    assign is_dirty    = (WMODE == WRITE_BACK) && entries[line_idx].valid && entries[line_idx].dirty;
+    assign is_write    = ce_i && (we_i != '0);
+    assign end_fill    = mem_valid && (cache_idx == word_idx_t'(FILL_WORDS-1));
+    assign end_evict   = cache_valid && !mem_busy_i && (mem_idx == word_idx_t'(FILL_WORDS-1));
 
     always_comb begin
         unique case (current_state)
@@ -198,14 +199,10 @@ module DMCtrl
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            address_r   <= '0;
-            evict_tag_r <= '0;
-        end
-        else if (ce_i && miss && (current_state == IDLE)) begin
-            address_r   <= address_i;
-            evict_tag_r <= entries[line_idx].tag;
-        end
+        if (!rst_n)
+            address_r <= '0;
+        else if (ce_i && miss && (current_state == IDLE))
+            address_r <= address_i;
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
