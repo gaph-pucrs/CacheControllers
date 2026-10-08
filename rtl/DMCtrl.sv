@@ -70,12 +70,6 @@ module DMCtrl
     typedef logic [OFFSET_WIDTH-1:0] offset_t;
     typedef logic [WORD_IDX_W-1:0]   word_idx_t;
 
-    typedef enum logic [2:0] {
-        IDLE  = 3'b001,
-        FILL  = 3'b010,
-        EVICT = 3'b100
-    } fsm_t;
-
     typedef struct packed {
         logic valid;
         logic dirty;
