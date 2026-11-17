@@ -13,6 +13,8 @@
 // * PUCRS - Pontifical Catholic University of Rio Grande do Sul <https://pucrs.br/>
 //------------------------------------------------------------------------------
 
+`include "DMPkg.sv"
+
 module DMDebug
     import DMPkg::*;
 #(
@@ -20,7 +22,7 @@ module DMDebug
     /* as DMCtrl.<param>: constants can't be hierarchical (IEEE 1800 6.20.2), and     */
     /* each cache configuration needs its own DMDebug copy, or the widths read        */
     /* through DMCtrl.<signal> are fixed once for all caches. The widths are unused   */
-    /* here, but they set the widths of DMCtrl.tag_r/line_idx_r, so they must still   */
+    /* here, but they set the widths of DMCtrl.tag/line_idx, so they must still       */
     /* split the copies.                                                              */
     /* verilator lint_off UNUSEDPARAM */
     parameter int unsigned ADDR_WIDTH   = 20,
@@ -53,9 +55,9 @@ module DMDebug
     always @(posedge DMCtrl.clk) begin
         if (fd != 0) begin
             if (fill_done)
-                $fdisplay(fd, "%0d,FILL,%0d,%0d",  $time, DMCtrl.line_idx_r, DMCtrl.tag_r);
+                $fdisplay(fd, "%0d,FILL,%0d,%0d",  $time, DMCtrl.line_idx, DMCtrl.tag);
             if (evict_done)
-                $fdisplay(fd, "%0d,EVICT,%0d,%0d", $time, DMCtrl.line_idx_r, DMCtrl.evict_tag_r);
+                $fdisplay(fd, "%0d,EVICT,%0d,%0d", $time, DMCtrl.line_idx, DMCtrl.evict_tag);
             if (dirty_set)
                 $fdisplay(fd, "%0d,DIRTY,%0d,%0d", $time, DMCtrl.line_idx, DMCtrl.tag);
         end
