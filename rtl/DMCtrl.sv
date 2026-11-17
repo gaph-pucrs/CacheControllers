@@ -7,18 +7,25 @@
 // - Connects two memory buses:
 //   (a) "cache_*" connects to a small SRAM used as the cache data store
 //   (b) "a_*", "c_*", "d_*", "e_*" connect to the main memory
-// - Core side is an OBI subordinate: gnt on a hit, rvalid in the next cycle
+// - Core side is an OBI subordinate: a hit is passed to the cache SRAM
 // - Memory side is a TileLink 1.9.3 TL-C master, one operation at a time,
 //   one 32-bit word per beat, without coherence yet (no channel B, every
 //   line is held with Trunk permission):
 //     fill:          A AcquireBlock NtoT -> D GrantData beats -> E GrantAck
 //     evict:         C ReleaseData TtoN beats -> D ReleaseAck
 //     write-through: A PutPartialData -> D AccessAck
-//   d_ready is always high: a response may come in the cycle of its request
+//   Outside a fill, d_ready is always high: a response may come in the cycle
+//   of its request
 // - Miss: fetch from RAM, fill cache, then grant (the request holds until gnt)
 // - Write (WRITE_BACK=0): write-through — hits go to cache and memory; gnt when the Put is accepted
 // - Write (WRITE_BACK=1): write-back   — hits go to cache only; dirty evict on miss
-// - The cache SRAM answers in the next cycle and holds its output while not read
+// - Cache SRAM side is an OBI manager, any latency. Its responses can't be
+//   stalled, so evicted words wait for channel C in a RingBuffer that a read
+//   is only issued into when it has room. GrantData beats wait for the SRAM
+//   in another RingBuffer, as a TileLink beat may be retracted, an OBI request not.
+//   The SRAM serves either the core (IDLE, PUT) or the line transfers (FILL,
+//   GRANT_ACK, EVICT): the state only changes between the two with no SRAM
+//   access in flight, so every SRAM response in IDLE and PUT goes to the core.
 //   Address decode : addr = {tag, index, offset}
 // * GAPH - Hardware Design Support Group
 // * PUCRS - Pontifical Catholic University of Rio Grande do Sul <https://pucrs.br/>
@@ -50,13 +57,15 @@ module DMCtrl
     output logic                        rvalid_o,
     output logic [31:0]                 rdata_o,
 
-    /* Cache SRAM interface */
-    output logic                        cache_ce_o,
-    output logic [3:0]                  cache_we_o,
-    output logic [CACHE_WIDTH -1:0]     cache_addr_o,
-    input  logic [31:0]                 cache_data_i,
-    output logic [31:0]                 cache_data_o,
-    /* @todo: add cache_busy_i if the SRAM has a non-zero latency -- needs memory buffering with bypass */
+    /* Cache SRAM interface: OBI manager */
+    output logic                        cache_req_o,
+    input  logic                        cache_gnt_i,
+    output logic [CACHE_WIDTH-1:0]      cache_addr_o,
+    output logic                        cache_we_o,
+    output logic [3:0]                  cache_be_o,
+    output logic [31:0]                 cache_wdata_o,
+    input  logic                        cache_rvalid_i,
+    input  logic [31:0]                 cache_rdata_i,
 
     /* Main memory interface: TileLink master, channel A */
     output logic                        a_valid_o,
@@ -130,17 +139,34 @@ module DMCtrl
     logic       is_dirty;
     logic       is_write;
     logic       put_hit;
+    logic       hit_access;
+    logic       put_access;
+    logic       core_access;
+    logic       sram_issue;
+    logic       drained;
     logic       filling;
-    logic       evicting;
-    logic       evicting_r;
-    logic       acquire_sent;
-    logic       release_sent;
-    logic       release_acked;
-    logic       fill_beat;
+    logic       fill_write;
     logic       end_fill;
+    logic       filled;
+    logic       evicting;
+    logic       evict_read;
+    logic       evict_credit;
+    logic       reads_done;
     logic       release_beat;
     logic       end_evict;
-    logic       evict_read;
+    logic       release_sent;
+    logic       acked;
+    logic       put_written;
+    logic       acquire_sent;
+    logic       evict_room;
+    logic       evict_almost_full;
+    logic       evict_push;
+    logic       fill_push;
+    logic       fill_room;
+    logic       fill_valid;
+    logic [31:0] fill_data;
+    logic [3:0] inflight;
+    logic [3:0] inflight_next;
     tag_t       tag;
     tag_t       evict_tag;
     fsm_t       next_state;
@@ -162,35 +188,47 @@ module DMCtrl
     assign is_write     = req_i && we_i;
     assign put_hit      = (WMODE == WRITE_THROUGH) && is_write && !miss && (current_state == IDLE);
 
-    /* GrantData beats are written to the cache as they arrive */
-    assign filling      = (current_state == FILL);
-    assign fill_beat    = filling && d_valid_i;
-    assign end_fill     = fill_beat && (beat == word_idx_t'(FILL_WORDS-1));
+    /* Core accesses: hits in IDLE, except write-through writes, which write the */
+    /* SRAM in PUT once their PutPartialData was accepted (the request holds)    */
+    assign hit_access   = req_i && !miss && (current_state == IDLE) && !put_hit;
+    assign put_access   = req_i && (current_state == PUT) && !put_written;
+    assign core_access  = hit_access || put_access;
 
-    /* ReleaseData streams the line: the SRAM word read in a cycle is the beat   */
-    /* offered in the next one, and the SRAM holds it while the beat stalls.     */
-    /* ReleaseAck may come at any time after the first beat (spec 4.2.2), so the */
-    /* eviction ends when both the last beat is sent and the ack has come.       */
+    /* SRAM accesses in flight. ponytail: 4 bits, widen if the SRAM takes more than 15 */
+    assign sram_issue    = cache_req_o && cache_gnt_i;
+    assign inflight_next = inflight + 4'(sram_issue) - 4'(cache_rvalid_i);
+    assign drained       = (inflight_next == '0);
+
+    /* Fill: GrantData beats wait in fill_buf for the SRAM */
+    assign filling      = (current_state == FILL);
+    assign fill_push    = filling && d_valid_i;
+    assign fill_write   = filling && fill_valid && cache_gnt_i;
+    assign end_fill     = fill_write && (beat == word_idx_t'(FILL_WORDS-1));
+
+    /* Evict: a read is issued only if evict_buf has room for it and for the one in */
+    /* flight; ReleaseAck may come at any time after the first beat (spec 4.2.2)    */
     assign evicting     = (current_state == EVICT);
+    assign evict_credit = (inflight == '0) ? evict_room
+                        : (inflight == 4'd1) && !evict_almost_full;
+    assign evict_read   = evicting && !reads_done && evict_credit;
+    assign evict_push   = evicting && cache_rvalid_i;
     assign release_beat = c_valid_o && c_ready_i;
     assign end_evict    = release_beat && (beat == word_idx_t'(FILL_WORDS-1));
-    assign evict_read   = evicting && (!evicting_r || c_ready_i);
-    assign read_beat    = beat + word_idx_t'(release_beat);
 
     always_comb begin
         unique case (current_state)
             IDLE:  begin
-                if (req_i && miss)
+                if (req_i && miss && drained)
                     next_state = is_dirty ? EVICT : FILL;
-                else if (put_hit && a_ready_i && !d_valid_i)
+                else if (put_hit && a_ready_i)
                     next_state = PUT;
                 else
                     next_state = IDLE;
             end
-            FILL:      next_state = end_fill  ? GRANT_ACK : FILL;
-            GRANT_ACK: next_state = e_ready_i ? IDLE      : GRANT_ACK;
-            EVICT:     next_state = ((release_sent || end_evict) && (release_acked || d_valid_i)) ? IDLE : EVICT;
-            PUT:       next_state = d_valid_i ? IDLE : PUT;
+            FILL:      next_state = ((filled || end_fill) && drained) ? GRANT_ACK : FILL;
+            GRANT_ACK: next_state = e_ready_i ? IDLE : GRANT_ACK;
+            EVICT:     next_state = ((release_sent || end_evict) && (acked || d_valid_i)) ? IDLE : EVICT;
+            PUT:       next_state = ((put_written || (put_access && cache_gnt_i)) && (acked || d_valid_i)) ? IDLE : PUT;
             default:   next_state = IDLE;
         endcase
     end
@@ -204,9 +242,9 @@ module DMCtrl
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
-            evicting_r <= 1'b0;
+            inflight <= '0;
         else
-            evicting_r <= evicting;
+            inflight <= inflight_next;
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -218,28 +256,60 @@ module DMCtrl
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
+            filled <= 1'b0;
+        else
+            filled <= filling && (filled || end_fill);
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            reads_done <= 1'b0;
+        else
+            reads_done <= evicting && (reads_done || (sram_issue && read_beat == word_idx_t'(FILL_WORDS-1)));
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
             release_sent <= 1'b0;
         else
             release_sent <= evicting && (release_sent || end_evict);
     end
 
+    /* ReleaseAck or AccessAck, which may come with the first beat of the request */
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
-            release_acked <= 1'b0;
+            acked <= 1'b0;
         else
-            release_acked <= evicting && (release_acked || d_valid_i);
+            acked <= (next_state == EVICT || next_state == PUT) && (acked || d_valid_i);
     end
 
-    /* Beat received by the fill or offered by the eviction */
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            put_written <= 1'b0;
+        else
+            put_written <= (current_state == PUT) && (put_written || (put_access && cache_gnt_i));
+    end
+
+    /* Fill: beat written to the SRAM. Evict: beat sent on channel C */
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             beat <= '0;
         else if (filling)
-            beat <= beat + word_idx_t'(fill_beat);
+            beat <= beat + word_idx_t'(fill_write);
         else if (evicting)
-            beat <= read_beat;
+            beat <= beat + word_idx_t'(release_beat);
         else
             beat <= '0;
+    end
+
+    /* Evict: beat read from the SRAM */
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            read_beat <= '0;
+        else if (evicting)
+            read_beat <= read_beat + word_idx_t'(sram_issue);
+        else
+            read_beat <= '0;
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -272,33 +342,80 @@ module DMCtrl
         end
     end
 
+    /* verilator lint_off PINCONNECTEMPTY */
+    RingBuffer #(
+        .DATA_SIZE              (32),
+        .BUFFER_SIZE            (2 ),
+        .FIRST_WORD_FALL_THROUGH(1 ),
+        .ALMOST_FULL_THRESHOLD  (1 ),
+        .ALMOST_EMPTY_THRESHOLD (0 )
+    ) evict_buf (
+        .clk_i         (clk              ),
+        .rst_ni        (rst_n            ),
+        .buf_rst_i     (1'b0             ),
+        .rx_i          (evict_push       ),
+        .rx_ack_o      (evict_room       ),
+        .data_i        (cache_rdata_i    ),
+        .tx_o          (c_valid_o        ),
+        .tx_ack_i      (c_ready_i        ),
+        .data_o        (c_data_o         ),
+        .count_o       (                 ),
+        .almost_full_o (evict_almost_full),
+        .almost_empty_o(                 )
+    );
+
+    /* No fall through: the SRAM request must hold even if d_valid is retracted */
+    RingBuffer #(
+        .DATA_SIZE              (32),
+        .BUFFER_SIZE            (2 ),
+        .FIRST_WORD_FALL_THROUGH(0 ),
+        .ALMOST_FULL_THRESHOLD  (0 ),
+        .ALMOST_EMPTY_THRESHOLD (0 )
+    ) fill_buf (
+        .clk_i         (clk         ),
+        .rst_ni        (rst_n       ),
+        .buf_rst_i     (1'b0        ),
+        .rx_i          (fill_push   ),
+        .rx_ack_o      (fill_room   ),
+        .data_i        (d_data_i    ),
+        .tx_o          (fill_valid  ),
+        .tx_ack_i      (fill_write  ),
+        .data_o        (fill_data   ),
+        .count_o       (            ),
+        .almost_full_o (            ),
+        .almost_empty_o(            )
+    );
+    /* verilator lint_on PINCONNECTEMPTY */
+
 ////////////////////////////////////////////////////////////////////////////////
 //  Cache interface
 ////////////////////////////////////////////////////////////////////////////////
 
-    /* Access cache on a granted hit, on each fill beat, or to read the next eviction beat */
-    assign cache_ce_o   = gnt_o || fill_beat || evict_read;
-
-    /* Write to cache on write hit or during fill; read otherwise */
     always_comb begin
         unique case (current_state)
-            IDLE:    cache_we_o = we_i ? be_i : 4'h0;
-            FILL:    cache_we_o = 4'hF;
-            default: cache_we_o = 4'h0;
+            FILL: begin
+                cache_req_o   = fill_valid;
+                cache_addr_o  = {line_idx, beat, 2'b00};
+                cache_we_o    = 1'b1;
+                cache_be_o    = 4'hF;
+                cache_wdata_o = fill_data;
+            end
+            EVICT: begin
+                cache_req_o   = evict_read;
+                cache_addr_o  = {line_idx, read_beat, 2'b00};
+                cache_we_o    = 1'b0;
+                cache_be_o    = 4'hF;
+                cache_wdata_o = fill_data;
+            end
+            default: begin
+                cache_req_o   = core_access;
+                cache_addr_o  = {line_idx, offset};
+                cache_we_o    = we_i;
+                cache_be_o    = be_i;
+                cache_wdata_o = wdata_i;
+            end
         endcase
     end
-
-    /* Cache address on read hit or write from input, otherwise from fill/evict beat */
-    always_comb begin
-        unique case (current_state)
-            IDLE:    cache_addr_o = {line_idx, offset};
-            FILL:    cache_addr_o = {line_idx, beat, 2'b00};
-            default: cache_addr_o = {line_idx, read_beat, 2'b00};
-        endcase
-    end
-
-    /* During fill, use data from main memory, otherwise from input */
-    assign cache_data_o = (current_state == IDLE) ? wdata_i : d_data_i;
 
 ////////////////////////////////////////////////////////////////////////////////
 //  Memory interface
@@ -315,19 +432,17 @@ module DMCtrl
     assign a_data_o    = wdata_i;
     assign a_corrupt_o = 1'b0;
 
-    /* Channel C: ReleaseData of the dirty line */
-    assign c_valid_o   = evicting && evicting_r && !release_sent;
+    /* Channel C: ReleaseData of the dirty line, beats from evict_buf */
     assign c_opcode_o  = TL_C_RELEASE_DATA;
     assign c_param_o   = TL_PRUNE_TTON;
     assign c_size_o    = 4'(OFFSET_WIDTH);
     assign c_source_o  = '0;
     assign c_address_o = {evict_tag, line_idx, offset_t'(0)};
-    assign c_data_o    = cache_data_i;
     assign c_corrupt_o = 1'b0;
 
-    /* Channel D: always accepted (GrantData, ReleaseAck or AccessAck) */
+    /* Channel D: GrantData beats while fill_buf has room; acks always */
     /* ponytail: d_denied and d_corrupt are ignored, add error reporting when a slave can deny */
-    assign d_ready_o   = 1'b1;
+    assign d_ready_o   = filling ? fill_room : 1'b1;
 
     /* Channel E: GrantAck echoes the sink of the GrantData */
     assign e_valid_o   = (current_state == GRANT_ACK);
@@ -335,7 +450,7 @@ module DMCtrl
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             e_sink_o <= '0;
-        else if (fill_beat)
+        else if (fill_push && fill_room)
             e_sink_o <= d_sink_i;
     end
 
@@ -344,21 +459,12 @@ module DMCtrl
 ////////////////////////////////////////////////////////////////////////////////
 
     /**
-     * Grant only hits in IDLE. The request waits:
+     * The SRAM serves core accesses directly. The request waits:
      * - During a miss, until the line is filled (and evicted first if dirty)
      * - Write-through: on write hits, until the memory accepts the PutPartialData
     **/
-    assign gnt_o = req_i && !miss && (current_state == IDLE)
-                && !(put_hit && !a_ready_i);
-
-    /* The cache SRAM answers the granted access in the next cycle */
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            rvalid_o <= 1'b0;
-        else
-            rvalid_o <= gnt_o;
-    end
-
-    assign rdata_o = cache_data_i;
+    assign gnt_o    = core_access && cache_gnt_i;
+    assign rvalid_o = cache_rvalid_i && (current_state == IDLE || current_state == PUT);
+    assign rdata_o  = cache_rdata_i;
 
 endmodule
