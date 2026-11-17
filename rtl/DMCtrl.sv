@@ -19,6 +19,12 @@
 //                                            dirty line loses T on a ProbeBlock
 //     write-through: A PutPartialData     -> D AccessAck (lines never get dirty)
 //   The Grant may give more than asked (T for NtoB), the line keeps what it gives.
+// - Atomics run in front of the cache (AtomicALU) as a read and a write:
+//   excl_i makes a read need T, as a write; hold_i makes IDLE refuse probes,
+//   so the line stays T from the read to the write, or from an LR to its SC.
+//   lost_o tells, with the block address, when a line loses T (probe, drop,
+//   evict), which ends an LR reservation on it. Write-through caches can't
+//   keep atomics atomic: their writes go to memory without holding T.
 // - Probes are served in IDLE, in PUT, and in FILL until GrantData starts, as
 //   the Grant may wait for them (spec 9.2). They wait during EVICT, a GrantData
 //   burst and a pending GrantAck, which are higher priority messages in flight
@@ -60,6 +66,12 @@ module DMCtrl
     input  logic [31:0]                 wdata_i,
     output logic                        rvalid_o,
     output logic [31:0]                 rdata_o,
+
+    /* Atomics */
+    input  logic                        excl_i,
+    input  logic                        hold_i,
+    output logic                        lost_o,
+    output logic [ADDR_WIDTH-1:0]       lost_addr_o,
 
     /* Cache SRAM interface: OBI manager */
     output logic                        cache_req_o,
@@ -264,19 +276,20 @@ module DMCtrl
     /* Write-through writes only need to read the line: the write goes to memory */
     assign read_ok      = (line.perm != PERM_N) && (line.tag == tag);
     assign write_ok     = (WMODE == WRITE_THROUGH) ? read_ok : (line.perm == PERM_T) && (line.tag == tag);
-    assign need_fill    = req_i && !(we_i ? write_ok : read_ok);
+    assign need_fill    = req_i && !((we_i || excl_i) ? write_ok : read_ok);
     assign dirty_victim = line.dirty;
 
     /* Line transfers start with no probe and no GrantAck in flight */
     assign leave_idle   = (current_state == IDLE) && need_fill && !probe_busy && !e_pending;
 
     /* The SRAM serves the core in IDLE and PUT, while no probe is in progress.  */
-    /* A presented probe goes first, unless a core request is already waiting.   */
+    /* A presented probe goes first, unless a core request is already waiting,   */
+    /* or hold_i refuses probes.                                                 */
     /* Write-through writes reach the SRAM in PUT, after their PutPartialData.   */
     assign put_hit      = (WMODE == WRITE_THROUGH) && req_i && we_i && write_ok
                        && (current_state == IDLE) && !probe_busy;
     assign hit_access   = req_i && !need_fill && !(we_i && WMODE == WRITE_THROUGH)
-                       && (current_state == IDLE) && !probe_busy && (core_waiting || !b_valid_i);
+                       && (current_state == IDLE) && !probe_busy && (core_waiting || hold_i || !b_valid_i);
     assign put_access   = req_i && (current_state == PUT) && !put_written;
     assign core_access  = hit_access || put_access;
     assign dirty_set    = (WMODE == WRITE_BACK) && hit_access && we_i && sram_issue && !line.dirty;
@@ -422,7 +435,7 @@ module DMCtrl
             b_ready_o = 1'b0;
         else begin
             unique case (current_state)
-                IDLE:    b_ready_o = !core_waiting && !leave_idle && !e_pending;
+                IDLE:    b_ready_o = !core_waiting && !leave_idle && !e_pending && !hold_i;
                 FILL:    b_ready_o = !granting && !e_pending;
                 PUT:     b_ready_o = 1'b1;
                 default: b_ready_o = 1'b0;
@@ -636,6 +649,19 @@ module DMCtrl
         end
     end
 
+    /* A line loses T: a probe below T, a clean drop or a dirty evict. They */
+    /* never happen in the same cycle.                                      */
+    always_comb begin
+        if (probe_accept && probe_hit && probe_old == PERM_T && probe_new != PERM_T) begin
+            lost_o      = 1'b1;
+            lost_addr_o = {b_tag, b_index, offset_t'(0)};
+        end
+        else begin
+            lost_o      = (leave_idle && !dirty_victim && line.perm == PERM_T) || end_evict;
+            lost_addr_o = {line.tag, line_idx, offset_t'(0)};
+        end
+    end
+
 ////////////////////////////////////////////////////////////////////////////////
 //  Cache SRAM
 ////////////////////////////////////////////////////////////////////////////////
@@ -727,7 +753,7 @@ module DMCtrl
     always_comb begin
         if (!filling)
             a_param_o = 3'd0;
-        else if ((WMODE == WRITE_BACK) && we_i)
+        else if ((WMODE == WRITE_BACK) && (we_i || excl_i))
             a_param_o = TL_GROW_NTOT;
         else
             a_param_o = TL_GROW_NTOB;
