@@ -6,12 +6,19 @@
 // Direct-mapped cache controller with external memories.
 // - Connects two memory buses:
 //   (a) "cache_*" connects to a small SRAM used as the cache data store
-//   (b) "mem_*"   connects to the main memory
+//   (b) "a_*", "c_*", "d_*", "e_*" connect to the main memory
 // - Core side is an OBI subordinate: gnt on a hit, rvalid in the next cycle
+// - Memory side is a TileLink 1.9.3 TL-C master, one operation at a time,
+//   one 32-bit word per beat, without coherence yet (no channel B, every
+//   line is held with Trunk permission):
+//     fill:          A AcquireBlock NtoT -> D GrantData beats -> E GrantAck
+//     evict:         C ReleaseData TtoN beats -> D ReleaseAck
+//     write-through: A PutPartialData -> D AccessAck
+//   d_ready is always high: a response may come in the cycle of its request
 // - Miss: fetch from RAM, fill cache, then grant (the request holds until gnt)
-// - Write (WRITE_BACK=0): write-through — hits go to cache and memory immediately
+// - Write (WRITE_BACK=0): write-through — hits go to cache and memory; gnt when the Put is accepted
 // - Write (WRITE_BACK=1): write-back   — hits go to cache only; dirty evict on miss
-// - Single Port Memory access: Through a controller for instruction and data usage.
+// - The cache SRAM answers in the next cycle and holds its output while not read
 //   Address decode : addr = {tag, index, offset}
 // * GAPH - Hardware Design Support Group
 // * PUCRS - Pontifical Catholic University of Rio Grande do Sul <https://pucrs.br/>
@@ -25,6 +32,8 @@ module DMCtrl
     parameter int unsigned ADDR_WIDTH   = 20,
     parameter int unsigned CACHE_WIDTH  = 12,
     parameter int unsigned OFFSET_WIDTH = 6,
+    parameter int unsigned SOURCE_WIDTH = 1,
+    parameter int unsigned SINK_WIDTH   = 1,
     parameter write_mode_t WMODE        = WRITE_BACK
 )
 (
@@ -49,13 +58,47 @@ module DMCtrl
     output logic [31:0]                 cache_data_o,
     /* @todo: add cache_busy_i if the SRAM has a non-zero latency -- needs memory buffering with bypass */
 
-    /* Main memory interface */
-    output logic                        mem_ce_o,
-    output logic [3:0]                  mem_we_o,
-    output logic [ADDR_WIDTH-1:0]       mem_addr_o,
-    input  logic [31:0]                 mem_data_i,
-    output logic [31:0]                 mem_data_o,
-    input  logic                        mem_busy_i
+    /* Main memory interface: TileLink master, channel A */
+    output logic                        a_valid_o,
+    input  logic                        a_ready_i,
+    output logic [2:0]                  a_opcode_o,
+    output logic [2:0]                  a_param_o,
+    output logic [3:0]                  a_size_o,
+    output logic [SOURCE_WIDTH-1:0]     a_source_o,
+    output logic [ADDR_WIDTH-1:0]       a_address_o,
+    output logic [3:0]                  a_mask_o,
+    output logic [31:0]                 a_data_o,
+    output logic                        a_corrupt_o,
+
+    /* Channel C */
+    output logic                        c_valid_o,
+    input  logic                        c_ready_i,
+    output logic [2:0]                  c_opcode_o,
+    output logic [2:0]                  c_param_o,
+    output logic [3:0]                  c_size_o,
+    output logic [SOURCE_WIDTH-1:0]     c_source_o,
+    output logic [ADDR_WIDTH-1:0]       c_address_o,
+    output logic [31:0]                 c_data_o,
+    output logic                        c_corrupt_o,
+
+    /* Channel D: one operation at a time, so only valid, sink and data are needed */
+    input  logic                        d_valid_i,
+    output logic                        d_ready_o,
+    /* verilator lint_off UNUSEDSIGNAL */
+    input  logic [2:0]                  d_opcode_i,
+    input  logic [1:0]                  d_param_i,
+    input  logic [3:0]                  d_size_i,
+    input  logic [SOURCE_WIDTH-1:0]     d_source_i,
+    input  logic                        d_denied_i,
+    input  logic                        d_corrupt_i,
+    /* verilator lint_on UNUSEDSIGNAL */
+    input  logic [SINK_WIDTH-1:0]       d_sink_i,
+    input  logic [31:0]                 d_data_i,
+
+    /* Channel E */
+    output logic                        e_valid_o,
+    input  logic                        e_ready_i,
+    output logic [SINK_WIDTH-1:0]       e_sink_o
 );
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -86,42 +129,69 @@ module DMCtrl
     logic       miss;
     logic       is_dirty;
     logic       is_write;
+    logic       put_hit;
+    logic       filling;
+    logic       evicting;
+    logic       evicting_r;
+    logic       acquire_sent;
+    logic       release_sent;
+    logic       release_acked;
+    logic       fill_beat;
     logic       end_fill;
+    logic       release_beat;
     logic       end_evict;
-    logic       mem_valid;
-    logic       cache_valid;
+    logic       evict_read;
     tag_t       tag;
     tag_t       evict_tag;
     fsm_t       next_state;
     fsm_t       current_state;
     offset_t    offset;
     line_idx_t  line_idx;
-    word_idx_t  mem_idx;
-    word_idx_t  cache_idx;
+    word_idx_t  beat;
+    word_idx_t  read_beat;
     entry_t     entries       [NB_BLOCKS];
 
     /* OBI holds addr_i until gnt, which only comes after the fill: */
     /* fill and evict can use addr_i without registering it         */
-    assign tag         = addr_i[ADDR_WIDTH-1:ADDR_WIDTH-TAG_WIDTH];
-    assign miss        = !entries[line_idx].valid || entries[line_idx].tag != tag;
-    assign offset      = addr_i[OFFSET_WIDTH-1:0];
-    assign line_idx    = addr_i[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
-    assign evict_tag   = entries[line_idx].tag;
-    assign is_dirty    = (WMODE == WRITE_BACK) && entries[line_idx].valid && entries[line_idx].dirty;
-    assign is_write    = req_i && we_i;
-    assign end_fill    = mem_valid && (cache_idx == word_idx_t'(FILL_WORDS-1));
-    assign end_evict   = cache_valid && !mem_busy_i && (mem_idx == word_idx_t'(FILL_WORDS-1));
+    assign tag          = addr_i[ADDR_WIDTH-1:ADDR_WIDTH-TAG_WIDTH];
+    assign miss         = !entries[line_idx].valid || entries[line_idx].tag != tag;
+    assign offset       = addr_i[OFFSET_WIDTH-1:0];
+    assign line_idx     = addr_i[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
+    assign evict_tag    = entries[line_idx].tag;
+    assign is_dirty     = (WMODE == WRITE_BACK) && entries[line_idx].valid && entries[line_idx].dirty;
+    assign is_write     = req_i && we_i;
+    assign put_hit      = (WMODE == WRITE_THROUGH) && is_write && !miss && (current_state == IDLE);
+
+    /* GrantData beats are written to the cache as they arrive */
+    assign filling      = (current_state == FILL);
+    assign fill_beat    = filling && d_valid_i;
+    assign end_fill     = fill_beat && (beat == word_idx_t'(FILL_WORDS-1));
+
+    /* ReleaseData streams the line: the SRAM word read in a cycle is the beat   */
+    /* offered in the next one, and the SRAM holds it while the beat stalls.     */
+    /* ReleaseAck may come at any time after the first beat (spec 4.2.2), so the */
+    /* eviction ends when both the last beat is sent and the ack has come.       */
+    assign evicting     = (current_state == EVICT);
+    assign release_beat = c_valid_o && c_ready_i;
+    assign end_evict    = release_beat && (beat == word_idx_t'(FILL_WORDS-1));
+    assign evict_read   = evicting && (!evicting_r || c_ready_i);
+    assign read_beat    = beat + word_idx_t'(release_beat);
 
     always_comb begin
         unique case (current_state)
             IDLE:  begin
                 if (req_i && miss)
                     next_state = is_dirty ? EVICT : FILL;
+                else if (put_hit && a_ready_i && !d_valid_i)
+                    next_state = PUT;
                 else
                     next_state = IDLE;
             end
-            FILL:  next_state = end_fill  ? IDLE : FILL;
-            EVICT: next_state = end_evict ? IDLE : EVICT;
+            FILL:      next_state = end_fill  ? GRANT_ACK : FILL;
+            GRANT_ACK: next_state = e_ready_i ? IDLE      : GRANT_ACK;
+            EVICT:     next_state = ((release_sent || end_evict) && (release_acked || d_valid_i)) ? IDLE : EVICT;
+            PUT:       next_state = d_valid_i ? IDLE : PUT;
+            default:   next_state = IDLE;
         endcase
     end
 
@@ -133,29 +203,43 @@ module DMCtrl
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            cache_idx <= '0;
-        end
-        else begin
-            unique case (current_state)
-                IDLE:  cache_idx <= '0;
-                FILL:  cache_idx <=                 mem_valid  ? cache_idx + 1'b1 : cache_idx;
-                EVICT: cache_idx <= cache_valid && !mem_busy_i ? cache_idx + 1'b1 : cache_idx;
-            endcase
-        end
+        if (!rst_n)
+            evicting_r <= 1'b0;
+        else
+            evicting_r <= evicting;
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            mem_idx <= '0;
-        end
-        else begin
-            unique case (current_state)
-                IDLE:  mem_idx <= '0;
-                FILL:  mem_idx <=                !mem_busy_i ? mem_idx + 1'b1 : mem_idx;
-                EVICT: mem_idx <= cache_valid && !mem_busy_i ? mem_idx + 1'b1 : mem_idx;
-            endcase
-        end
+        if (!rst_n)
+            acquire_sent <= 1'b0;
+        else
+            acquire_sent <= filling && (acquire_sent || a_ready_i);
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            release_sent <= 1'b0;
+        else
+            release_sent <= evicting && (release_sent || end_evict);
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            release_acked <= 1'b0;
+        else
+            release_acked <= evicting && (release_acked || d_valid_i);
+    end
+
+    /* Beat received by the fill or offered by the eviction */
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            beat <= '0;
+        else if (filling)
+            beat <= beat + word_idx_t'(fill_beat);
+        else if (evicting)
+            beat <= read_beat;
+        else
+            beat <= '0;
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -183,34 +267,7 @@ module DMCtrl
                     if (end_evict)
                         entries[line_idx].dirty <= 1'b0;
                 end
-            endcase
-        end
-    end
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            mem_valid <= 1'b0;
-        end
-        else begin
-            unique case (current_state)
-                FILL:    mem_valid <= !mem_busy_i;
-                default: mem_valid <= 1'b0;
-            endcase
-        end
-    end
-
-    /* If !mem_busy_i, the current cache read is consumed, and thus the read index will be increased */
-    /* This invalidates the next data, requiring an additional cycle to read from cache before writing to memory */
-    /* This avoids buffering the cache reads in case the main memory is busy during eviction */
-    /* But this is very inneficient */
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            cache_valid <= 1'b0;
-        end
-        else begin
-            unique case (current_state)
-                EVICT:   cache_valid <= !(cache_valid && !mem_busy_i);
-                default: cache_valid <= 1'b0;
+                default: ;
             endcase
         end
     end
@@ -219,53 +276,68 @@ module DMCtrl
 //  Cache interface
 ////////////////////////////////////////////////////////////////////////////////
 
-    /* Access cache during fill, evict or on a granted hit */
-    assign cache_ce_o   = gnt_o || (current_state == EVICT) || ((current_state == FILL) && mem_valid);
+    /* Access cache on a granted hit, on each fill beat, or to read the next eviction beat */
+    assign cache_ce_o   = gnt_o || fill_beat || evict_read;
 
-    /* Write to cache on write hit or during fill; force read during evict */
+    /* Write to cache on write hit or during fill; read otherwise */
     always_comb begin
         unique case (current_state)
-            IDLE:  cache_we_o   = we_i ? be_i : 4'h0;
-            FILL:  cache_we_o   = 4'hF;
-            EVICT: cache_we_o   = 4'h0;
+            IDLE:    cache_we_o = we_i ? be_i : 4'h0;
+            FILL:    cache_we_o = 4'hF;
+            default: cache_we_o = 4'h0;
         endcase
     end
 
-    /* Cache address on read hit or write from input, otherwise from fill/evict */
-    assign cache_addr_o = (current_state == IDLE) ? {line_idx, offset} : {line_idx, cache_idx, 2'b00};
+    /* Cache address on read hit or write from input, otherwise from fill/evict beat */
+    always_comb begin
+        unique case (current_state)
+            IDLE:    cache_addr_o = {line_idx, offset};
+            FILL:    cache_addr_o = {line_idx, beat, 2'b00};
+            default: cache_addr_o = {line_idx, read_beat, 2'b00};
+        endcase
+    end
 
     /* During fill, use data from main memory, otherwise from input */
-    assign cache_data_o = (current_state == IDLE) ? wdata_i : mem_data_i;
+    assign cache_data_o = (current_state == IDLE) ? wdata_i : d_data_i;
 
 ////////////////////////////////////////////////////////////////////////////////
 //  Memory interface
 ////////////////////////////////////////////////////////////////////////////////
 
-    /* Write-through: also enable memory on write hits in IDLE */
-    /* Write-back:    only enable memory during fill or eviction */
-    assign mem_ce_o = (current_state == FILL)
-                   || ((current_state == EVICT) && cache_valid)
-                   || ((WMODE == WRITE_THROUGH) && is_write && !miss && current_state == IDLE);
+    /* Channel A: AcquireBlock of the missing line, or PutPartialData of a write-through hit */
+    assign a_valid_o   = put_hit || (filling && !acquire_sent);
+    assign a_opcode_o  = filling ? TL_A_ACQUIRE_BLOCK : TL_A_PUT_PARTIAL_DATA;
+    assign a_param_o   = filling ? TL_GROW_NTOT       : 3'd0;
+    assign a_size_o    = filling ? 4'(OFFSET_WIDTH)   : 4'd2;
+    assign a_source_o  = '0;
+    assign a_address_o = filling ? {tag, line_idx, offset_t'(0)} : {addr_i[ADDR_WIDTH-1:2], 2'b00};
+    assign a_mask_o    = filling ? 4'hF : be_i;
+    assign a_data_o    = wdata_i;
+    assign a_corrupt_o = 1'b0;
 
-    /* Write-through writes on hits; write-back writes only on eviction */
-    always_comb begin
-        if ((WMODE == WRITE_THROUGH) && is_write && !miss && current_state == IDLE)
-            mem_we_o = be_i;
-        else if (current_state == EVICT)
-            mem_we_o = 4'hF;
-        else
-            mem_we_o = 4'h0;
+    /* Channel C: ReleaseData of the dirty line */
+    assign c_valid_o   = evicting && evicting_r && !release_sent;
+    assign c_opcode_o  = TL_C_RELEASE_DATA;
+    assign c_param_o   = TL_PRUNE_TTON;
+    assign c_size_o    = 4'(OFFSET_WIDTH);
+    assign c_source_o  = '0;
+    assign c_address_o = {evict_tag, line_idx, offset_t'(0)};
+    assign c_data_o    = cache_data_i;
+    assign c_corrupt_o = 1'b0;
+
+    /* Channel D: always accepted (GrantData, ReleaseAck or AccessAck) */
+    /* ponytail: d_denied and d_corrupt are ignored, add error reporting when a slave can deny */
+    assign d_ready_o   = 1'b1;
+
+    /* Channel E: GrantAck echoes the sink of the GrantData */
+    assign e_valid_o   = (current_state == GRANT_ACK);
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            e_sink_o <= '0;
+        else if (fill_beat)
+            e_sink_o <= d_sink_i;
     end
-
-    /* Fill/write-through use the incoming address; evict uses the dirty line's tag */
-    assign mem_addr_o = (current_state == EVICT)
-                      ? {evict_tag, line_idx, mem_idx, 2'b00}
-                      : ((WMODE == WRITE_THROUGH) && current_state == IDLE)
-                        ? addr_i
-                        : {tag, line_idx, mem_idx, 2'b00};
-
-    /* Write-through sends CPU data on hits; evict sends cache data */
-    assign mem_data_o = ((WMODE == WRITE_THROUGH) && current_state == IDLE) ? wdata_i : cache_data_i;
 
 ////////////////////////////////////////////////////////////////////////////////
 //  Core interface
@@ -274,10 +346,10 @@ module DMCtrl
     /**
      * Grant only hits in IDLE. The request waits:
      * - During a miss, until the line is filled (and evicted first if dirty)
-     * - Write-through: on write hits while the memory is busy
+     * - Write-through: on write hits, until the memory accepts the PutPartialData
     **/
     assign gnt_o = req_i && !miss && (current_state == IDLE)
-                && !((WMODE == WRITE_THROUGH) && we_i && mem_busy_i);
+                && !(put_hit && !a_ready_i);
 
     /* The cache SRAM answers the granted access in the next cycle */
     always_ff @(posedge clk or negedge rst_n) begin
