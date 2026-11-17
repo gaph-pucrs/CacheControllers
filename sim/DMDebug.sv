@@ -7,8 +7,9 @@
 // same parameters as the bound instance:
 //     bind DMCtrl DMDebug #(.ADDR_WIDTH(ADDR_WIDTH), .CACHE_WIDTH(CACHE_WIDTH),
 //                           .OFFSET_WIDTH(OFFSET_WIDTH), .WMODE(WMODE)) u_debug ();
-// Logs every FILL, EVICT and DIRTY event as CSV to ./debug/<instance path>.csv:
+// Logs every FILL, EVICT, DIRTY and PROBE event as CSV to ./debug/<instance path>.csv:
 //     time,event,line,tag
+// A PROBE is logged when accepted, with the permission it leaves: PROBE_N, _B or _T
 // * GAPH - Hardware Design Support Group
 // * PUCRS - Pontifical Catholic University of Rio Grande do Sul <https://pucrs.br/>
 //------------------------------------------------------------------------------
@@ -28,16 +29,16 @@ module DMDebug
     parameter int unsigned ADDR_WIDTH   = 20,
     parameter int unsigned CACHE_WIDTH  = 12,
     parameter int unsigned OFFSET_WIDTH = 6,
-    /* verilator lint_on UNUSEDPARAM */
     parameter write_mode_t WMODE        = WRITE_BACK
+    /* verilator lint_on UNUSEDPARAM */
 );
 
-    logic fill_done, evict_done, dirty_set;
+    logic fill_done, evict_done, dirty_set, probe_done;
 
-    assign fill_done  = (DMCtrl.current_state == FILL ) && DMCtrl.end_fill;
-    assign evict_done = (DMCtrl.current_state == EVICT) && DMCtrl.end_evict;
-    assign dirty_set  = (DMCtrl.current_state == IDLE ) && (WMODE == WRITE_BACK)
-                     &&  DMCtrl.is_write && !DMCtrl.miss && !DMCtrl.entries[DMCtrl.line_idx].dirty;
+    assign fill_done  = DMCtrl.end_fill;
+    assign evict_done = DMCtrl.end_evict;
+    assign dirty_set  = DMCtrl.dirty_set;
+    assign probe_done = DMCtrl.probe_accept && DMCtrl.probe_hit;
 
     string file_name;
     int    fd;
@@ -60,6 +61,9 @@ module DMDebug
                 $fdisplay(fd, "%0d,EVICT,%0d,%0d", $time, DMCtrl.line_idx, DMCtrl.evict_tag);
             if (dirty_set)
                 $fdisplay(fd, "%0d,DIRTY,%0d,%0d", $time, DMCtrl.line_idx, DMCtrl.tag);
+            if (probe_done)
+                $fdisplay(fd, "%0d,PROBE_%s,%0d,%0d", $time, DMCtrl.probe_new.name().substr(5, 5),
+                          DMCtrl.b_index, DMCtrl.b_tag);
         end
     end
 

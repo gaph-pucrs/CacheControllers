@@ -3,29 +3,33 @@
 // IVAN PALADIN JUNIOR - 16/MAR/2026
 // ANGELO DAL ZOTTO    - 30/ABR/2026
 //------------------------------------------------------------------------------
-// Direct-mapped cache controller with external memories.
+// Direct-mapped coherent cache controller with external memories.
 // - Connects two memory buses:
 //   (a) "cache_*" connects to a small SRAM used as the cache data store
-//   (b) "a_*", "c_*", "d_*", "e_*" connect to the main memory
+//   (b) "a_*" to "e_*" connect to the main memory
 // - Core side is an OBI subordinate: a hit is passed to the cache SRAM
-// - Memory side is a TileLink 1.9.3 TL-C master, one operation at a time,
-//   one 32-bit word per beat, without coherence yet (no channel B, every
-//   line is held with Trunk permission):
-//     fill:          A AcquireBlock NtoT -> D GrantData beats -> E GrantAck
-//     evict:         C ReleaseData TtoN beats -> D ReleaseAck
-//     write-through: A PutPartialData -> D AccessAck
-//   Outside a fill, d_ready is always high: a response may come in the cycle
-//   of its request
+// - Cache SRAM side is an OBI manager, any latency
+// - Memory side is a TileLink 1.9.3 TL-C master, one Acquire, Release or Put
+//   at a time, one 32-bit word per beat. Each line holds a permission:
+//   N (invalid), B (read only, clean) or T (read and write, maybe dirty)
+//     read miss:     A AcquireBlock NtoB  -> D GrantData beats -> E GrantAck
+//     write miss:    A AcquireBlock NtoT  (a B line is dropped first, it is clean)
+//     dirty victim:  C ReleaseData TtoN   -> D ReleaseAck (clean victims are dropped)
+//     probe:         B ProbeBlock/Perm    -> C ProbeAck, or ProbeAckData if a
+//                                            dirty line loses T on a ProbeBlock
+//     write-through: A PutPartialData     -> D AccessAck (lines never get dirty)
+//   The Grant may give more than asked (T for NtoB), the line keeps what it gives.
+// - Probes are served in IDLE, in PUT, and in FILL until GrantData starts, as
+//   the Grant may wait for them (spec 9.2). They wait during EVICT, a GrantData
+//   burst and a pending GrantAck, which are higher priority messages in flight
+//   (spec 5). GrantAck goes out on the last GrantData beat, before the SRAM
+//   writes end, so it never waits behind a ProbeAck.
+// - SRAM responses can't be stalled: line words read for channel C wait in
+//   c_buf, which a read is only issued into when it has room. GrantData beats
+//   wait for the SRAM in fill_buf, as a TileLink beat may be retracted and an
+//   OBI request not. owners routes each SRAM response, in order, to the core,
+//   to c_buf, or nowhere (fill writes).
 // - Miss: fetch from RAM, fill cache, then grant (the request holds until gnt)
-// - Write (WRITE_BACK=0): write-through — hits go to cache and memory; gnt when the Put is accepted
-// - Write (WRITE_BACK=1): write-back   — hits go to cache only; dirty evict on miss
-// - Cache SRAM side is an OBI manager, any latency. Its responses can't be
-//   stalled, so evicted words wait for channel C in a RingBuffer that a read
-//   is only issued into when it has room. GrantData beats wait for the SRAM
-//   in another RingBuffer, as a TileLink beat may be retracted, an OBI request not.
-//   The SRAM serves either the core (IDLE, PUT) or the line transfers (FILL,
-//   GRANT_ACK, EVICT): the state only changes between the two with no SRAM
-//   access in flight, so every SRAM response in IDLE and PUT goes to the core.
 //   Address decode : addr = {tag, index, offset}
 // * GAPH - Hardware Design Support Group
 // * PUCRS - Pontifical Catholic University of Rio Grande do Sul <https://pucrs.br/>
@@ -79,6 +83,20 @@ module DMCtrl
     output logic [31:0]                 a_data_o,
     output logic                        a_corrupt_o,
 
+    /* Channel B: only ProbeBlock and ProbePerm, which carry no data */
+    input  logic                        b_valid_i,
+    output logic                        b_ready_o,
+    input  logic [2:0]                  b_opcode_i,
+    input  logic [2:0]                  b_param_i,
+    input  logic [3:0]                  b_size_i,
+    input  logic [SOURCE_WIDTH-1:0]     b_source_i,
+    input  logic [ADDR_WIDTH-1:0]       b_address_i,
+    /* verilator lint_off UNUSEDSIGNAL */
+    input  logic [3:0]                  b_mask_i,
+    input  logic [31:0]                 b_data_i,
+    input  logic                        b_corrupt_i,
+    /* verilator lint_on UNUSEDSIGNAL */
+
     /* Channel C */
     output logic                        c_valid_o,
     input  logic                        c_ready_i,
@@ -90,17 +108,17 @@ module DMCtrl
     output logic [31:0]                 c_data_o,
     output logic                        c_corrupt_o,
 
-    /* Channel D: one operation at a time, so only valid, sink and data are needed */
+    /* Channel D: one operation at a time, so the opcode is known */
     input  logic                        d_valid_i,
     output logic                        d_ready_o,
     /* verilator lint_off UNUSEDSIGNAL */
     input  logic [2:0]                  d_opcode_i,
-    input  logic [1:0]                  d_param_i,
     input  logic [3:0]                  d_size_i,
     input  logic [SOURCE_WIDTH-1:0]     d_source_i,
     input  logic                        d_denied_i,
     input  logic                        d_corrupt_i,
     /* verilator lint_on UNUSEDSIGNAL */
+    input  logic [1:0]                  d_param_i,
     input  logic [SINK_WIDTH-1:0]       d_sink_i,
     input  logic [31:0]                 d_data_i,
 
@@ -126,110 +144,157 @@ module DMCtrl
     typedef logic [WORD_IDX_W-1:0]   word_idx_t;
 
     typedef struct packed {
-        logic valid;
-        logic dirty;
-        tag_t tag;
+        perm_t perm;
+        logic  dirty;
+        tag_t  tag;
     } entry_t;
 
+    /* Owner of an SRAM response */
+    typedef enum logic [1:0] {
+        TO_NONE = 2'd0,
+        TO_CORE = 2'd1,
+        TO_C    = 2'd2
+    } owner_t;
+
+    localparam word_idx_t LAST_WORD = word_idx_t'(FILL_WORDS-1);
+
 ////////////////////////////////////////////////////////////////////////////////
-//  Control logic
+//  Signals
 ////////////////////////////////////////////////////////////////////////////////
 
-    logic       miss;
-    logic       is_dirty;
-    logic       is_write;
+    /* Core requests */
+    logic       read_ok;
+    logic       write_ok;
+    logic       need_fill;
+    logic       dirty_victim;
+    logic       leave_idle;
     logic       put_hit;
     logic       hit_access;
     logic       put_access;
     logic       core_access;
-    logic       sram_issue;
-    logic       drained;
-    logic       filling;
-    logic       fill_write;
-    logic       end_fill;
-    logic       filled;
-    logic       evicting;
-    logic       evict_read;
-    logic       evict_credit;
-    logic       reads_done;
-    logic       release_beat;
-    logic       end_evict;
-    logic       release_sent;
-    logic       acked;
+    logic       core_waiting;
     logic       put_written;
+    logic       dirty_set;
+    tag_t       tag;
+    tag_t       evict_tag;
+    offset_t    offset;
+    line_idx_t  line_idx;
+    entry_t     line;
+    fsm_t       next_state;
+    fsm_t       current_state;
+    entry_t     entries [NB_BLOCKS];
+
+    /* Fill */
+    logic       filling;
     logic       acquire_sent;
-    logic       evict_room;
-    logic       evict_almost_full;
-    logic       evict_push;
+    logic       grant_beat;
+    logic       granting;
     logic       fill_push;
     logic       fill_room;
     logic       fill_valid;
+    logic       fill_write;
+    logic       end_fill;
+    logic       e_pending;
     logic [31:0] fill_data;
-    logic [3:0] inflight;
-    logic [3:0] inflight_next;
-    tag_t       tag;
-    tag_t       evict_tag;
-    fsm_t       next_state;
-    fsm_t       current_state;
-    offset_t    offset;
-    line_idx_t  line_idx;
-    word_idx_t  beat;
-    word_idx_t  read_beat;
-    entry_t     entries       [NB_BLOCKS];
+    perm_t      grant_perm;
+    word_idx_t  grant_count;
+    word_idx_t  fill_count;
+
+    /* Probes */
+    logic       probe_busy;
+    logic       probe_accept;
+    logic       probe_hit;
+    logic       probe_data;
+    tag_t       b_tag;
+    line_idx_t  b_index;
+    entry_t     b_line;
+    perm_t      probe_cap;
+    perm_t      probe_old;
+    perm_t      probe_new;
+    logic [2:0] probe_report;
+    probe_fsm_t probe_state;
+    logic [2:0] probe_param;
+    logic [3:0] probe_size;
+    logic [SOURCE_WIDTH-1:0] probe_source;
+    logic [ADDR_WIDTH-1:0]   probe_address;
+
+    /* Line words to channel C */
+    logic       evicting;
+    logic       streaming;
+    logic       stream_read;
+    logic       stream_beat;
+    logic       end_stream;
+    logic       end_evict;
+    logic       reads_done;
+    logic       release_sent;
+    logic       acked;
+    logic       c_push;
+    logic       c_room;
+    logic       c_almost_full;
+    logic       c_credit;
+    logic       c_buf_valid;
+    logic [1:0] c_inflight;
+    line_idx_t  stream_index;
+    word_idx_t  read_count;
+    word_idx_t  send_count;
+
+    /* Cache SRAM */
+    logic       sram_issue;
+    logic       stream_pick;
+    logic       stream_held;
+    logic       stream_sent;
+    logic       fill_sent;
+    logic       owner_room;
+    logic       owner_valid;
+    owner_t     owner_in;
+    owner_t     owner_out;
+
+////////////////////////////////////////////////////////////////////////////////
+//  Core requests
+////////////////////////////////////////////////////////////////////////////////
 
     /* OBI holds addr_i until gnt, which only comes after the fill: */
     /* fill and evict can use addr_i without registering it         */
-    assign tag          = addr_i[ADDR_WIDTH-1:ADDR_WIDTH-TAG_WIDTH];
-    assign miss         = !entries[line_idx].valid || entries[line_idx].tag != tag;
-    assign offset       = addr_i[OFFSET_WIDTH-1:0];
-    assign line_idx     = addr_i[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
-    assign evict_tag    = entries[line_idx].tag;
-    assign is_dirty     = (WMODE == WRITE_BACK) && entries[line_idx].valid && entries[line_idx].dirty;
-    assign is_write     = req_i && we_i;
-    assign put_hit      = (WMODE == WRITE_THROUGH) && is_write && !miss && (current_state == IDLE);
+    assign tag       = addr_i[ADDR_WIDTH-1:ADDR_WIDTH-TAG_WIDTH];
+    assign offset    = addr_i[OFFSET_WIDTH-1:0];
+    assign line_idx  = addr_i[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
+    assign line      = entries[line_idx];
+    assign evict_tag = line.tag;
 
-    /* Core accesses: hits in IDLE, except write-through writes, which write the */
-    /* SRAM in PUT once their PutPartialData was accepted (the request holds)    */
-    assign hit_access   = req_i && !miss && (current_state == IDLE) && !put_hit;
+    /* Write-through writes only need to read the line: the write goes to memory */
+    assign read_ok      = (line.perm != PERM_N) && (line.tag == tag);
+    assign write_ok     = (WMODE == WRITE_THROUGH) ? read_ok : (line.perm == PERM_T) && (line.tag == tag);
+    assign need_fill    = req_i && !(we_i ? write_ok : read_ok);
+    assign dirty_victim = line.dirty;
+
+    /* Line transfers start with no probe and no GrantAck in flight */
+    assign leave_idle   = (current_state == IDLE) && need_fill && !probe_busy && !e_pending;
+
+    /* The SRAM serves the core in IDLE and PUT, while no probe is in progress.  */
+    /* A presented probe goes first, unless a core request is already waiting.   */
+    /* Write-through writes reach the SRAM in PUT, after their PutPartialData.   */
+    assign put_hit      = (WMODE == WRITE_THROUGH) && req_i && we_i && write_ok
+                       && (current_state == IDLE) && !probe_busy;
+    assign hit_access   = req_i && !need_fill && !(we_i && WMODE == WRITE_THROUGH)
+                       && (current_state == IDLE) && !probe_busy && (core_waiting || !b_valid_i);
     assign put_access   = req_i && (current_state == PUT) && !put_written;
     assign core_access  = hit_access || put_access;
-
-    /* SRAM accesses in flight. ponytail: 4 bits, widen if the SRAM takes more than 15 */
-    assign sram_issue    = cache_req_o && cache_gnt_i;
-    assign inflight_next = inflight + 4'(sram_issue) - 4'(cache_rvalid_i);
-    assign drained       = (inflight_next == '0);
-
-    /* Fill: GrantData beats wait in fill_buf for the SRAM */
-    assign filling      = (current_state == FILL);
-    assign fill_push    = filling && d_valid_i;
-    assign fill_write   = filling && fill_valid && cache_gnt_i;
-    assign end_fill     = fill_write && (beat == word_idx_t'(FILL_WORDS-1));
-
-    /* Evict: a read is issued only if evict_buf has room for it and for the one in */
-    /* flight; ReleaseAck may come at any time after the first beat (spec 4.2.2)    */
-    assign evicting     = (current_state == EVICT);
-    assign evict_credit = (inflight == '0) ? evict_room
-                        : (inflight == 4'd1) && !evict_almost_full;
-    assign evict_read   = evicting && !reads_done && evict_credit;
-    assign evict_push   = evicting && cache_rvalid_i;
-    assign release_beat = c_valid_o && c_ready_i;
-    assign end_evict    = release_beat && (beat == word_idx_t'(FILL_WORDS-1));
+    assign dirty_set    = (WMODE == WRITE_BACK) && hit_access && we_i && sram_issue && !line.dirty;
 
     always_comb begin
         unique case (current_state)
-            IDLE:  begin
-                if (req_i && miss && drained)
-                    next_state = is_dirty ? EVICT : FILL;
+            IDLE:    begin
+                if (leave_idle)
+                    next_state = dirty_victim ? EVICT : FILL;
                 else if (put_hit && a_ready_i)
                     next_state = PUT;
                 else
                     next_state = IDLE;
             end
-            FILL:      next_state = ((filled || end_fill) && drained) ? GRANT_ACK : FILL;
-            GRANT_ACK: next_state = e_ready_i ? IDLE : GRANT_ACK;
-            EVICT:     next_state = ((release_sent || end_evict) && (acked || d_valid_i)) ? IDLE : EVICT;
-            PUT:       next_state = ((put_written || (put_access && cache_gnt_i)) && (acked || d_valid_i)) ? IDLE : PUT;
-            default:   next_state = IDLE;
+            FILL:    next_state = end_fill ? IDLE : FILL;
+            EVICT:   next_state = ((release_sent || end_evict) && (acked || d_valid_i)) ? IDLE : EVICT;
+            PUT:     next_state = ((put_written || (put_access && sram_issue)) && (acked || d_valid_i)) ? IDLE : PUT;
+            default: next_state = IDLE;
         endcase
     end
 
@@ -240,12 +305,29 @@ module DMCtrl
             current_state <= next_state;
     end
 
+    /* A core SRAM request not yet granted must hold */
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
-            inflight <= '0;
+            core_waiting <= 1'b0;
         else
-            inflight <= inflight_next;
+            core_waiting <= core_access && !sram_issue;
     end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            put_written <= 1'b0;
+        else
+            put_written <= (current_state == PUT) && (put_written || (put_access && sram_issue));
+    end
+
+////////////////////////////////////////////////////////////////////////////////
+//  Fill: AcquireBlock, GrantData beats through fill_buf, GrantAck
+////////////////////////////////////////////////////////////////////////////////
+
+    assign filling    = (current_state == FILL);
+    assign fill_push  = filling && d_valid_i;
+    assign grant_beat = fill_push && fill_room;
+    assign end_fill   = fill_sent && (fill_count == LAST_WORD);
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
@@ -254,18 +336,224 @@ module DMCtrl
             acquire_sent <= filling && (acquire_sent || a_ready_i);
     end
 
+    /* A GrantData burst started: probes wait until the fill ends */
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
-            filled <= 1'b0;
+            granting <= 1'b0;
         else
-            filled <= filling && (filled || end_fill);
+            granting <= filling && !end_fill && (granting || grant_beat);
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            grant_count <= '0;
+        else if (!filling)
+            grant_count <= '0;
+        else
+            grant_count <= grant_count + word_idx_t'(grant_beat);
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            fill_count <= '0;
+        else if (!filling)
+            fill_count <= '0;
+        else
+            fill_count <= fill_count + word_idx_t'(fill_sent);
+    end
+
+    /* GrantData caps the permission: toT gives T, anything else B */
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            grant_perm <= PERM_N;
+        else if (grant_beat)
+            grant_perm <= (d_param_i == 2'(TL_CAP_TOT)) ? PERM_T : PERM_B;
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            e_sink_o <= '0;
+        else if (grant_beat)
+            e_sink_o <= d_sink_i;
+    end
+
+    /* GrantAck goes out on the last GrantData beat, even while the SRAM writes go on */
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            e_pending <= 1'b0;
+        else
+            e_pending <= (e_pending && !e_ready_i) || (grant_beat && grant_count == LAST_WORD);
+    end
+
+    assign e_valid_o = e_pending;
+
+    /* No fall through: the SRAM request must hold even if d_valid is retracted */
+    /* verilator lint_off PINCONNECTEMPTY */
+    RingBuffer #(
+        .DATA_SIZE              (32),
+        .BUFFER_SIZE            (2 ),
+        .FIRST_WORD_FALL_THROUGH(0 ),
+        .ALMOST_FULL_THRESHOLD  (0 ),
+        .ALMOST_EMPTY_THRESHOLD (0 )
+    ) fill_buf (
+        .clk_i         (clk         ),
+        .rst_ni        (rst_n       ),
+        .buf_rst_i     (1'b0        ),
+        .rx_i          (fill_push   ),
+        .rx_ack_o      (fill_room   ),
+        .data_i        (d_data_i    ),
+        .tx_o          (fill_valid  ),
+        .tx_ack_i      (fill_sent   ),
+        .data_o        (fill_data   ),
+        .count_o       (            ),
+        .almost_full_o (            ),
+        .almost_empty_o(            )
+    );
+    /* verilator lint_on PINCONNECTEMPTY */
+
+////////////////////////////////////////////////////////////////////////////////
+//  Probes
+////////////////////////////////////////////////////////////////////////////////
+
+    assign probe_busy = (probe_state != P_IDLE);
+
+    always_comb begin
+        if (probe_busy)
+            b_ready_o = 1'b0;
+        else begin
+            unique case (current_state)
+                IDLE:    b_ready_o = !core_waiting && !leave_idle && !e_pending;
+                FILL:    b_ready_o = !granting && !e_pending;
+                PUT:     b_ready_o = 1'b1;
+                default: b_ready_o = 1'b0;
+            endcase
+        end
+    end
+
+    assign probe_accept = b_valid_i && b_ready_o;
+
+    assign b_tag     = b_address_i[ADDR_WIDTH-1:ADDR_WIDTH-TAG_WIDTH];
+    assign b_index   = b_address_i[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
+    assign b_line    = entries[b_index];
+    assign probe_hit = (b_line.perm != PERM_N) && (b_line.tag == b_tag);
+    assign probe_old = probe_hit ? b_line.perm : PERM_N;
+
+    always_comb begin
+        unique case (b_param_i)
+            TL_CAP_TOT: probe_cap = PERM_T;
+            TL_CAP_TOB: probe_cap = PERM_B;
+            default:    probe_cap = PERM_N;
+        endcase
+    end
+
+    assign probe_new  = (probe_old < probe_cap) ? probe_old : probe_cap;
+
+    /* A dirty line losing T is written back, unless ProbePerm says the data is not needed */
+    assign probe_data = probe_hit && b_line.dirty && (probe_new != PERM_T)
+                     && (b_opcode_i == TL_B_PROBE_BLOCK);
+
+    /* Shrink or Report from the old to the new permission */
+    always_comb begin
+        unique case ({probe_old, probe_new})
+            {PERM_T, PERM_T}: probe_report = TL_REPORT_TTOT;
+            {PERM_T, PERM_B}: probe_report = TL_PRUNE_TTOB;
+            {PERM_T, PERM_N}: probe_report = TL_PRUNE_TTON;
+            {PERM_B, PERM_B}: probe_report = TL_REPORT_BTOB;
+            {PERM_B, PERM_N}: probe_report = TL_PRUNE_BTON;
+            default:          probe_report = TL_REPORT_NTON;
+        endcase
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            probe_state <= P_IDLE;
+        else begin
+            unique case (probe_state)
+                P_IDLE:  if (probe_accept) probe_state <= probe_data ? P_DATA : P_ACK;
+                P_ACK:   if (c_ready_i)    probe_state <= P_IDLE;
+                P_DATA:  if (end_stream)   probe_state <= P_IDLE;
+                default:                   probe_state <= P_IDLE;
+            endcase
+        end
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            probe_param <= '0;
+        else if (probe_accept)
+            probe_param <= probe_report;
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            probe_size <= '0;
+        else if (probe_accept)
+            probe_size <= b_size_i;
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            probe_source <= '0;
+        else if (probe_accept)
+            probe_source <= b_source_i;
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            probe_address <= '0;
+        else if (probe_accept)
+            probe_address <= b_address_i;
+    end
+
+////////////////////////////////////////////////////////////////////////////////
+//  Line words to channel C: ReleaseData (evict) or ProbeAckData (probe)
+////////////////////////////////////////////////////////////////////////////////
+
+    /* Evictions and probe write backs never overlap: probes wait during EVICT, */
+    /* and EVICT starts with no probe in progress. EVICT may outlast its last   */
+    /* beat, waiting for ReleaseAck: the stream ends with the beat.             */
+    assign evicting     = (current_state == EVICT);
+    assign streaming    = (evicting && !release_sent) || (probe_state == P_DATA);
+    assign stream_index = evicting ? line_idx : probe_address[ADDR_WIDTH-TAG_WIDTH-1:ADDR_WIDTH-TAG_WIDTH-INDEX_WIDTH];
+
+    /* A read is issued only if c_buf has room for it and for the one in flight */
+    assign c_credit     = (c_inflight == 2'd0) ? c_room
+                        : (c_inflight == 2'd1) && !c_almost_full;
+    assign stream_read  = streaming && !reads_done && c_credit;
+    assign stream_beat  = streaming && c_valid_o && c_ready_i;
+    assign end_stream   = stream_beat && (send_count == LAST_WORD);
+    assign end_evict    = evicting && end_stream;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            read_count <= '0;
+        else if (!streaming)
+            read_count <= '0;
+        else
+            read_count <= read_count + word_idx_t'(stream_sent);
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            send_count <= '0;
+        else if (!streaming)
+            send_count <= '0;
+        else
+            send_count <= send_count + word_idx_t'(stream_beat);
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             reads_done <= 1'b0;
         else
-            reads_done <= evicting && (reads_done || (sram_issue && read_beat == word_idx_t'(FILL_WORDS-1)));
+            reads_done <= streaming && !end_stream && (reads_done || (stream_sent && read_count == LAST_WORD));
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            c_inflight <= '0;
+        else
+            c_inflight <= c_inflight + 2'(stream_sent) - 2'(c_push);
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -283,65 +571,6 @@ module DMCtrl
             acked <= (next_state == EVICT || next_state == PUT) && (acked || d_valid_i);
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            put_written <= 1'b0;
-        else
-            put_written <= (current_state == PUT) && (put_written || (put_access && cache_gnt_i));
-    end
-
-    /* Fill: beat written to the SRAM. Evict: beat sent on channel C */
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            beat <= '0;
-        else if (filling)
-            beat <= beat + word_idx_t'(fill_write);
-        else if (evicting)
-            beat <= beat + word_idx_t'(release_beat);
-        else
-            beat <= '0;
-    end
-
-    /* Evict: beat read from the SRAM */
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            read_beat <= '0;
-        else if (evicting)
-            read_beat <= read_beat + word_idx_t'(sram_issue);
-        else
-            read_beat <= '0;
-    end
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            for (int i = 0; i < NB_BLOCKS; i++) begin
-                entries[i].valid <= 1'b0;
-                entries[i].dirty <= 1'b0;
-                entries[i].tag   <= '0;
-            end
-        end
-        else begin
-            unique case (current_state)
-                IDLE:  begin
-                    if ((WMODE == WRITE_BACK) && is_write && !miss)
-                        entries[line_idx].dirty <= 1'b1;
-                end
-                FILL:  begin
-                    if (end_fill) begin
-                        entries[line_idx].valid <= 1'b1;
-                        entries[line_idx].dirty <= 1'b0;
-                        entries[line_idx].tag   <= tag;
-                    end
-                end
-                EVICT: begin
-                    if (end_evict)
-                        entries[line_idx].dirty <= 1'b0;
-                end
-                default: ;
-            endcase
-        end
-    end
-
     /* verilator lint_off PINCONNECTEMPTY */
     RingBuffer #(
         .DATA_SIZE              (32),
@@ -349,73 +578,137 @@ module DMCtrl
         .FIRST_WORD_FALL_THROUGH(1 ),
         .ALMOST_FULL_THRESHOLD  (1 ),
         .ALMOST_EMPTY_THRESHOLD (0 )
-    ) evict_buf (
-        .clk_i         (clk              ),
-        .rst_ni        (rst_n            ),
-        .buf_rst_i     (1'b0             ),
-        .rx_i          (evict_push       ),
-        .rx_ack_o      (evict_room       ),
-        .data_i        (cache_rdata_i    ),
-        .tx_o          (c_valid_o        ),
-        .tx_ack_i      (c_ready_i        ),
-        .data_o        (c_data_o         ),
-        .count_o       (                 ),
-        .almost_full_o (evict_almost_full),
-        .almost_empty_o(                 )
-    );
-
-    /* No fall through: the SRAM request must hold even if d_valid is retracted */
-    RingBuffer #(
-        .DATA_SIZE              (32),
-        .BUFFER_SIZE            (2 ),
-        .FIRST_WORD_FALL_THROUGH(0 ),
-        .ALMOST_FULL_THRESHOLD  (0 ),
-        .ALMOST_EMPTY_THRESHOLD (0 )
-    ) fill_buf (
-        .clk_i         (clk         ),
-        .rst_ni        (rst_n       ),
-        .buf_rst_i     (1'b0        ),
-        .rx_i          (fill_push   ),
-        .rx_ack_o      (fill_room   ),
-        .data_i        (d_data_i    ),
-        .tx_o          (fill_valid  ),
-        .tx_ack_i      (fill_write  ),
-        .data_o        (fill_data   ),
-        .count_o       (            ),
-        .almost_full_o (            ),
-        .almost_empty_o(            )
+    ) c_buf (
+        .clk_i         (clk          ),
+        .rst_ni        (rst_n        ),
+        .buf_rst_i     (1'b0         ),
+        .rx_i          (c_push       ),
+        .rx_ack_o      (c_room       ),
+        .data_i        (cache_rdata_i),
+        .tx_o          (c_buf_valid  ),
+        .tx_ack_i      (c_ready_i    ),
+        .data_o        (c_data_o     ),
+        .count_o       (             ),
+        .almost_full_o (c_almost_full),
+        .almost_empty_o(             )
     );
     /* verilator lint_on PINCONNECTEMPTY */
 
 ////////////////////////////////////////////////////////////////////////////////
-//  Cache interface
+//  Line permissions
 ////////////////////////////////////////////////////////////////////////////////
 
-    always_comb begin
-        unique case (current_state)
-            FILL: begin
-                cache_req_o   = fill_valid;
-                cache_addr_o  = {line_idx, beat, 2'b00};
-                cache_we_o    = 1'b1;
-                cache_be_o    = 4'hF;
-                cache_wdata_o = fill_data;
+    /* Same-cycle updates never hit the same line: a probe is not accepted when */
+    /* IDLE is left, during EVICT or a GrantData burst, or with a core write    */
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (int i = 0; i < NB_BLOCKS; i++) begin
+                entries[i].perm  <= PERM_N;
+                entries[i].dirty <= 1'b0;
+                entries[i].tag   <= '0;
             end
-            EVICT: begin
-                cache_req_o   = evict_read;
-                cache_addr_o  = {line_idx, read_beat, 2'b00};
-                cache_we_o    = 1'b0;
-                cache_be_o    = 4'hF;
-                cache_wdata_o = fill_data;
+        end
+        else begin
+            if (probe_accept && probe_hit) begin
+                entries[b_index].perm  <= probe_new;
+                entries[b_index].dirty <= b_line.dirty && (probe_new == PERM_T);
             end
-            default: begin
-                cache_req_o   = core_access;
-                cache_addr_o  = {line_idx, offset};
-                cache_we_o    = we_i;
-                cache_be_o    = be_i;
-                cache_wdata_o = wdata_i;
+
+            if (dirty_set)
+                entries[line_idx].dirty <= 1'b1;
+
+            /* A clean line is dropped when its slot is filled */
+            if (leave_idle && !dirty_victim) begin
+                entries[line_idx].perm  <= PERM_N;
+                entries[line_idx].dirty <= 1'b0;
             end
-        endcase
+
+            if (end_fill) begin
+                entries[line_idx].perm  <= grant_perm;
+                entries[line_idx].dirty <= 1'b0;
+                entries[line_idx].tag   <= tag;
+            end
+
+            if (end_evict) begin
+                entries[line_idx].perm  <= PERM_N;
+                entries[line_idx].dirty <= 1'b0;
+            end
+        end
     end
+
+////////////////////////////////////////////////////////////////////////////////
+//  Cache SRAM
+////////////////////////////////////////////////////////////////////////////////
+
+    /* Only fill writes and probe reads share the SRAM (FILL before GrantData).  */
+    /* Fill writes go first, but a read request waiting for gnt must hold.       */
+    /* No request starts while owners is full; none can be waiting then.         */
+    assign fill_write  = filling && fill_valid;
+    assign stream_pick = stream_read && (stream_held || !fill_write);
+
+    always_comb begin
+        if (core_access) begin
+            cache_req_o   = owner_room;
+            cache_addr_o  = {line_idx, offset};
+            cache_we_o    = we_i;
+            cache_be_o    = be_i;
+            cache_wdata_o = wdata_i;
+            owner_in      = TO_CORE;
+        end
+        else if (stream_pick) begin
+            cache_req_o   = owner_room;
+            cache_addr_o  = {stream_index, read_count, 2'b00};
+            cache_we_o    = 1'b0;
+            cache_be_o    = 4'hF;
+            cache_wdata_o = fill_data;
+            owner_in      = TO_C;
+        end
+        else begin
+            cache_req_o   = fill_write && owner_room;
+            cache_addr_o  = {line_idx, fill_count, 2'b00};
+            cache_we_o    = 1'b1;
+            cache_be_o    = 4'hF;
+            cache_wdata_o = fill_data;
+            owner_in      = TO_NONE;
+        end
+    end
+
+    assign sram_issue  = cache_req_o && cache_gnt_i;
+    assign stream_sent = sram_issue && (owner_in == TO_C);
+    assign fill_sent   = sram_issue && (owner_in == TO_NONE);
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            stream_held <= 1'b0;
+        else
+            stream_held <= stream_pick && !sram_issue;
+    end
+
+    /* One owner per SRAM access in flight: at most 4 */
+    /* verilator lint_off PINCONNECTEMPTY */
+    RingBuffer #(
+        .DATA_SIZE              (2),
+        .BUFFER_SIZE            (4),
+        .FIRST_WORD_FALL_THROUGH(0),
+        .ALMOST_FULL_THRESHOLD  (0),
+        .ALMOST_EMPTY_THRESHOLD (0)
+    ) owners (
+        .clk_i         (clk           ),
+        .rst_ni        (rst_n         ),
+        .buf_rst_i     (1'b0          ),
+        .rx_i          (sram_issue    ),
+        .rx_ack_o      (owner_room    ),
+        .data_i        (owner_in      ),
+        .tx_o          (owner_valid   ),
+        .tx_ack_i      (cache_rvalid_i),
+        .data_o        (owner_out     ),
+        .count_o       (              ),
+        .almost_full_o (              ),
+        .almost_empty_o(              )
+    );
+    /* verilator lint_on PINCONNECTEMPTY */
+
+    assign c_push = cache_rvalid_i && owner_valid && (owner_out == TO_C);
 
 ////////////////////////////////////////////////////////////////////////////////
 //  Memory interface
@@ -424,7 +717,6 @@ module DMCtrl
     /* Channel A: AcquireBlock of the missing line, or PutPartialData of a write-through hit */
     assign a_valid_o   = put_hit || (filling && !acquire_sent);
     assign a_opcode_o  = filling ? TL_A_ACQUIRE_BLOCK : TL_A_PUT_PARTIAL_DATA;
-    assign a_param_o   = filling ? TL_GROW_NTOT       : 3'd0;
     assign a_size_o    = filling ? 4'(OFFSET_WIDTH)   : 4'd2;
     assign a_source_o  = '0;
     assign a_address_o = filling ? {tag, line_idx, offset_t'(0)} : {addr_i[ADDR_WIDTH-1:2], 2'b00};
@@ -432,27 +724,39 @@ module DMCtrl
     assign a_data_o    = wdata_i;
     assign a_corrupt_o = 1'b0;
 
-    /* Channel C: ReleaseData of the dirty line, beats from evict_buf */
-    assign c_opcode_o  = TL_C_RELEASE_DATA;
-    assign c_param_o   = TL_PRUNE_TTON;
-    assign c_size_o    = 4'(OFFSET_WIDTH);
-    assign c_source_o  = '0;
-    assign c_address_o = {evict_tag, line_idx, offset_t'(0)};
+    always_comb begin
+        if (!filling)
+            a_param_o = 3'd0;
+        else if ((WMODE == WRITE_BACK) && we_i)
+            a_param_o = TL_GROW_NTOT;
+        else
+            a_param_o = TL_GROW_NTOB;
+    end
+
+    /* Channel C: ReleaseData or ProbeAckData beats from c_buf, or a ProbeAck */
+    assign c_valid_o   = streaming ? c_buf_valid : (probe_state == P_ACK);
     assign c_corrupt_o = 1'b0;
+
+    always_comb begin
+        if (evicting) begin
+            c_opcode_o  = TL_C_RELEASE_DATA;
+            c_param_o   = TL_PRUNE_TTON;
+            c_size_o    = 4'(OFFSET_WIDTH);
+            c_source_o  = '0;
+            c_address_o = {evict_tag, line_idx, offset_t'(0)};
+        end
+        else begin
+            c_opcode_o  = (probe_state == P_DATA) ? TL_C_PROBE_ACK_DATA : TL_C_PROBE_ACK;
+            c_param_o   = probe_param;
+            c_size_o    = probe_size;
+            c_source_o  = probe_source;
+            c_address_o = probe_address;
+        end
+    end
 
     /* Channel D: GrantData beats while fill_buf has room; acks always */
     /* ponytail: d_denied and d_corrupt are ignored, add error reporting when a slave can deny */
-    assign d_ready_o   = filling ? fill_room : 1'b1;
-
-    /* Channel E: GrantAck echoes the sink of the GrantData */
-    assign e_valid_o   = (current_state == GRANT_ACK);
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            e_sink_o <= '0;
-        else if (fill_push && fill_room)
-            e_sink_o <= d_sink_i;
-    end
+    assign d_ready_o = filling ? fill_room : 1'b1;
 
 ////////////////////////////////////////////////////////////////////////////////
 //  Core interface
@@ -461,10 +765,11 @@ module DMCtrl
     /**
      * The SRAM serves core accesses directly. The request waits:
      * - During a miss, until the line is filled (and evicted first if dirty)
+     * - During a probe
      * - Write-through: on write hits, until the memory accepts the PutPartialData
     **/
-    assign gnt_o    = core_access && cache_gnt_i;
-    assign rvalid_o = cache_rvalid_i && (current_state == IDLE || current_state == PUT);
+    assign gnt_o    = core_access && sram_issue;
+    assign rvalid_o = cache_rvalid_i && owner_valid && (owner_out == TO_CORE);
     assign rdata_o  = cache_rdata_i;
 
 endmodule
